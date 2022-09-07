@@ -120,7 +120,7 @@ class GPT(nn.Module):
 
         type_given = config.model_type is not None
         params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
-        assert type_given ^ params_given # exactly one of these (XOR)
+        assert (type_given and not params_given) or (not type_given and params_given) # exactly one of these
         if type_given:
             # translate from model_type to detailed configuration
             config.merge_from_dict({
@@ -158,7 +158,7 @@ class GPT(nn.Module):
 
         # report number of parameters (note we don't count the decoder parameters in lm_head)
         n_params = sum(p.numel() for p in self.transformer.parameters())
-        print("number of parameters: %.2fM" % (n_params/1e6,))
+        # print("number of parameters: %.2fM" % (n_params/1e6,))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -279,14 +279,43 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    def mask_typical_logits(self, logits, mass):
+        min_tokens_to_keep = 1
+        filter_value = -float("Inf")
+
+        # calculate entropy
+        normalized = torch.nn.functional.log_softmax(logits, dim=-1)
+        p = torch.exp(normalized)
+        ent = -(normalized * p).nansum(-1, keepdim=True)
+
+        # shift and sort
+        shifted_logits = torch.abs((-normalized) - ent)
+        sorted_logits, sorted_indices = torch.sort(shifted_logits, descending=False)
+        sorted_logits = logits.gather(-1, sorted_indices)
+        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+
+        # Remove tokens with cumulative mass above the threshold
+        last_ind = (cumulative_probs < mass).sum(dim=1)
+        last_ind[last_ind < 0] = 0
+        sorted_indices_to_remove = sorted_logits > sorted_logits.gather(1, last_ind.view(-1, 1))
+        if min_tokens_to_keep > 1:
+            # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
+            sorted_indices_to_remove[..., : min_tokens_to_keep] = 0
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, filter_value)
+        return logits
+
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None, typical_p=None, eos_token_idx=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
+        assert not (top_k is not None and typical_p is not None), "top_k and typical_p can not be set at the same time!"
+        # token_probs = torch.zeros(max_new_tokens)
+        token_probs = []
+        for index in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
@@ -297,6 +326,9 @@ class GPT(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
                 logits[logits < v[:, [-1]]] = -float('Inf')
+            elif typical_p is not None:
+                logits = self.mask_typical_logits(logits, typical_p)
+                
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # either sample from the distribution or take the most likely element
@@ -305,6 +337,11 @@ class GPT(nn.Module):
             else:
                 _, idx_next = torch.topk(probs, k=1, dim=-1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+            if idx_next.item() != eos_token_idx:
+                idx = torch.cat((idx, idx_next), dim=1)
+                token_probs.append(probs.flatten()[idx_next.flatten()].item())
+                # token_probs[index] = probs.flatten()[idx_next.flatten()]
+            else:
+                break
+    
+        return idx, torch.tensor(token_probs)
